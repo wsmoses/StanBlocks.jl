@@ -1,11 +1,12 @@
 module PosteriorDBExt
 
 import PosteriorDB
+import StanBlocks
 import StanBlocks: julia_implementation, @stan, @parameters, @transformed_parameters, @model, @broadcasted
-import StanBlocks: bernoulli_lpmf, binomial_lpmf, log_sum_exp, logit, binomial_logit_lpmf, bernoulli_logit_lpmf, inv_logit, log_inv_logit, rep_vector, square, normal_lpdf, sd, multi_normal_lpdf, student_t_lpdf, gp_exp_quad_cov, log_mix, append_col, pow, diag_matrix, normal_id_glm_lpdf, rep_matrix, rep_row_vector
-using Statistics
+import StanBlocks: bernoulli_lpmf, binomial_lpmf, log_sum_exp, logit, binomial_logit_lpmf, bernoulli_logit_lpmf, inv_logit, log_inv_logit, rep_vector, square, normal_lpdf, sd, multi_normal_lpdf, student_t_lpdf, gp_exp_quad_cov, log_mix, append_row, append_col, pow, diag_matrix, normal_id_glm_lpdf, rep_matrix, rep_row_vector, cholesky_decompose, dot_self, cumulative_sum, softmax, log1m_inv_logit, matrix_constrain, integrate_ode_rk45, integrate_ode_bdf, poisson_lpdf, nothrow_log, categorical_lpmf, dirichlet_lpdf, exponential_lpdf, sub_col, stan_tail, dot_product, segment, inv_gamma_lpdf, diag_pre_multiply, multi_normal_cholesky_lpdf
+using Statistics, LinearAlgebra
 
-@inline PosteriorDB.implementation(model::PosteriorDB.Model, ::Val{:julia}) = julia_implementation(Val(Symbol(PosteriorDB.name(model))))
+@inline PosteriorDB.implementation(model::PosteriorDB.Model, ::Val{:stan_blocks}) = julia_implementation(Val(Symbol(PosteriorDB.name(model))))
 
 julia_implementation(posterior::PosteriorDB.Posterior) = julia_implementation(
     Val(Symbol(PosteriorDB.name(PosteriorDB.model(posterior))));
@@ -479,7 +480,6 @@ julia_implementation(::Val{:mesquite}; N, weight, diam1, diam2, canopy_height, t
     end
 end
 julia_implementation(::Val{:gp_regr}; N, x, y, kwargs...) = begin 
-        x_ = x
 @stan begin 
             target = 0.
             @parameters begin
@@ -488,14 +488,14 @@ julia_implementation(::Val{:gp_regr}; N, x, y, kwargs...) = begin
                 sigma::real(lower=0)
             end
             @model begin
-                cov = gp_exp_quad_cov(x_, alpha, rho) + diag_matrix(rep_vector(sigma, N));
+                cov = gp_exp_quad_cov(x, alpha, rho) + diag_matrix(rep_vector(sigma, N));
                 # L_cov = cholesky_decompose(cov);
   
                 rho ~ gamma(25, 4);
                 alpha ~ normal(0, 2);
                 sigma ~ normal(0, 1);
                 
-                y ~ multi_normal(rep_vector(0, N), cov);
+                y ~ multi_normal(rep_vector(0., N), cov);
                 # Think about how to do this
                 # y ~ multi_normal_cholesky(rep_vector(0, N), L_cov);
             end
@@ -606,7 +606,7 @@ julia_implementation(::Val{:kidscore_interaction_c2}; N, kid_score, mom_iq, mom_
         end
 end
 julia_implementation(::Val{:gp_pois_regr}; N, x, k, kwargs...) = begin 
-        x_ = x
+        nugget = diag_matrix(rep_vector(1e-10, N))
 @stan begin 
             target = 0.
             @parameters begin
@@ -615,10 +615,10 @@ julia_implementation(::Val{:gp_pois_regr}; N, x, k, kwargs...) = begin
                 f_tilde::vector[N]
             end
             @transformed_parameters begin 
-                cov = gp_exp_quad_cov(x_, alpha, rho) + diag_matrix(rep_vector(1e-10, N));
-                # L_cov = cholesky_decompose(cov);
-                # f = L_cov * f_tilde;
-                f = f_tilde
+                cov = gp_exp_quad_cov(x, alpha, rho)
+                cov .+= nugget;
+                L_cov = cholesky_decompose(cov);
+                f = L_cov * f_tilde;
             end
             @model begin
                 rho ~ gamma(25, 4);
@@ -651,24 +651,22 @@ julia_implementation(::Val{:surgical_model}; N, r, n, kwargs...) = begin
         return target
     end
 end
-julia_implementation(::Val{:wells_dae_c_model}) = begin 
-    wells_dae_model(; N, switched, dist, arsenic, educ, kwargs...) = begin 
-        c_dist100 = @. (dist - $mean(dist)) / 100.0;
-        c_arsenic = @. arsenic - $mean(arsenic);
-        da_inter = @. c_dist100 * c_arsenic;
-        educ4 = @. educ / 4.
-        X = hcat(c_dist100, c_arsenic, da_inter, educ4)
-@stan begin 
-            target = 0.
-            @parameters begin
-                alpha::real
-                beta::vector[4]
-            end
-            @model begin
-                switched ~ bernoulli_logit_glm(X, alpha, beta);
-            end
-            return target
+julia_implementation(::Val{:wells_dae_c_model}; N, switched, dist, arsenic, educ, kwargs...) = begin 
+    c_dist100 = @. (dist - $mean(dist)) / 100.0;
+    c_arsenic = @. arsenic - $mean(arsenic);
+    da_inter = @. c_dist100 * c_arsenic;
+    educ4 = @. educ / 4.
+    X = hcat(c_dist100, c_arsenic, da_inter, educ4)
+    @stan begin 
+        target = 0.
+        @parameters begin
+            alpha::real
+            beta::vector[4]
         end
+        @model begin
+            switched ~ bernoulli_logit_glm(X, alpha, beta);
+        end
+        return target
     end
 end
 julia_implementation(::Val{:Rate_4_model}; n, k, kwargs...) = begin 
@@ -1291,7 +1289,7 @@ julia_implementation(::Val{:ldaK5}; V, M, N, w, doc, alpha, beta, kwargs...) = b
             theta::simplex[M,5];
             phi::simplex[5,V];
         end
-        @model begin
+        @model @views begin
             for m in 1:M
                 theta[m] ~ dirichlet(alpha);
             end
@@ -1299,8 +1297,8 @@ julia_implementation(::Val{:ldaK5}; V, M, N, w, doc, alpha, beta, kwargs...) = b
                 phi[k] ~ dirichlet(beta);
             end
             for n in 1:N
-                # gamma = @broadcasted(log(theta[doc[n], :]) + log(phi[:, w[n]]))
-                # target += log_sum_exp(gamma);
+                gamma = @broadcasted(log(theta[doc[n], :]) + log(phi[:, w[n]]))
+                target += log_sum_exp(gamma);
             end
         end
         return target
@@ -1348,36 +1346,37 @@ julia_implementation(::Val{:nes}; N, partyid7, real_ideo, race_adj, educ1, gende
         end
 end
 julia_implementation(::Val{:dogs_log}; n_dogs, n_trials, y, kwargs...) = begin 
+    @assert size(y) == (n_dogs, n_trials)
 @stan begin 
-            target = 0.
-            @parameters begin
-                beta::vector[2];
-            end
-            @model begin
-                beta[1] ~ uniform(-100, 0);
-                beta[2] ~ uniform(0, 100);
-                for i in 1:n_dogs
-                    n_avoid = 0
-                    n_shock = 0
-                    for j in 1:n_trials
-                        p = inv_logit(beta[1] * n_avoid + beta[2] * n_shock)
-                        y[i, j] ~ bernoulli(p);
-                        n_avoid += 1 - y[i,j]
-                        n_shock += y[i,j]
-                    end
+        target = 0.
+        @parameters begin
+            beta::vector[2];
+        end
+        @model begin
+            beta[1] ~ uniform(-100, 0);
+            beta[2] ~ uniform(0, 100);
+            for i in 1:n_dogs
+                n_avoid = 0
+                n_shock = 0
+                for j in 1:n_trials
+                    p = inv_logit(beta[1] * n_avoid + beta[2] * n_shock)
+                    y[i, j] ~ bernoulli(p);
+                    n_avoid += 1 - y[i,j]
+                    n_shock += y[i,j]
                 end
             end
-            return target
         end
+        return target
+    end
 end
 julia_implementation(::Val{:GLM_Binomial_model};nyears, C, N, year, kwargs...) = begin 
         year_squared = year .^ 2
 @stan begin 
             target = 0.
             @parameters begin
-                alpha
-                beta1
-                beta2
+                alpha::real
+                beta1::real
+                beta2::real
             end
             logit_p = @broadcasted alpha + beta1 * year + beta2 * year_squared;
             @model begin
@@ -1620,7 +1619,7 @@ julia_implementation(::Val{:GLMM1_model};nsite, nobs, obs, obsyear, obssite, mis
         target = 0.
         @parameters begin
             alpha::vector[nsite]
-            mu_alpha
+            mu_alpha::real
             sd_alpha::real(lower=0,upper=5)
         end
     #   log_lambda = rep_matrix(alpha', nyear);
@@ -1652,7 +1651,7 @@ julia_implementation(::Val{:hier_2pl}; I, J, N, ii, jj, y, kwargs...) = begin
         @model begin
             L_Sigma = diag_pre_multiply(tau, L_Omega);
             for i in 1:I
-                target += multi_normal_cholesky_lpdf(xi[i], mu, L_Sigma);
+                target += multi_normal_cholesky_lpdf(xi[i, :], mu, L_Sigma);
             end
             theta ~ normal(0, 1);
             L_Omega ~ lkj_corr_cholesky(4);
@@ -1689,6 +1688,46 @@ julia_implementation(::Val{:dogs_hierarchical}; n_dogs, n_trials, y, kwargs...) 
                 y ~ bernoulli(@broadcasted(a ^ prev_shock * b ^ prev_avoid));
             end
             return target
+    end
+end
+
+
+julia_implementation(::Val{:dogs_nonhierarchical}; n_dogs, n_trials, y, kwargs...) = begin 
+    J = n_dogs;
+    T = n_trials;
+    prev_shock = zeros((J,T));
+    prev_avoid = zeros((J,T));
+    
+    for j in 1:J
+        prev_shock[j, 1] = 0;
+        prev_avoid[j, 1] = 0;
+        for t in 2:T
+            prev_shock[j, t] = prev_shock[j, t - 1] + y[j, t - 1];
+            prev_avoid[j, t] = prev_avoid[j, t - 1] + 1 - y[j, t - 1];
+        end
+    end
+    return @stan begin end
+    @stan begin 
+        @parameters begin
+            mu_logit_ab::vector[2]
+            sigma_logit_ab::vector(lower=0)[2]
+            L_logit_ab::cholesky_factor_corr[2]
+            z::matrix[J, 2]
+        end
+        @model @views begin
+            logit_ab = rep_vector(1, J) * mu_logit_ab'
+                                    + z * diag_pre_multiply(sigma_logit_ab, L_logit_ab);
+            Omega_logit_ab = L_logit_ab * L_logit_ab';
+            Sigma_logit_ab = quad_form_diag(Omega_logit_ab,
+                                                            sigma_logit_ab);
+            a = inv_logit(logit_ab[ : , 1]);
+            b = inv_logit(logit_ab[ : , 2]);
+            y ~ bernoulli(@broadcasted(a ^ prev_shock * b ^ prev_avoid));
+            mu_logit_ab ~ logistic(0, 1);
+            sigma_logit_ab ~ normal(0, 1);
+            L_logit_ab ~ lkj_corr_cholesky(2);
+            (z) ~ normal(0, 1);
+        end
     end
 end
 julia_implementation(::Val{:M0_model}; M, T, y, kwargs...) = begin
@@ -1763,7 +1802,7 @@ julia_implementation(::Val{:Mt_model}; M, T, y, kwargs...) = begin
                 omega::real(lower=0,upper=1)
                 p::vector(lower=0,upper=1)[T]
             end
-            @model begin
+            @model @views begin
                 for i in 1:M
                     if s[i] > 0
                         target += bernoulli_lpmf(1, omega) + bernoulli_lpmf(y[i,:], p)
@@ -1826,87 +1865,246 @@ julia_implementation(::Val{:election88_full};
         end
 end
 julia_implementation(::Val{:nn_rbm1bJ10}; N, M, x, K, y, kwargs...) = begin 
-        J = 10
-        nu_alpha = 0.5;
-        s2_0_alpha = (0.05 / M ^ (1 / nu_alpha)) ^ 2;
-        nu_beta = 0.5;
-        s2_0_beta = (0.05 / J ^ (1 / nu_beta)) ^ 2;
-        
-        ones = rep_vector(1., N);
-        x1 = append_col(ones, x);
-@stan begin 
-            target = 0.
-            @parameters begin
-                sigma2_alpha::real(lower=0);
-                sigma2_beta::real(lower=0);
-                alpha::matrix[M, J];
-                beta::matrix[J, K - 1];
-                alpha1::row_vector[J];
-                beta1::row_vector[K - 1];
-            end
-            @model begin
-                v = append_col(
+            J = 10
+            nu_alpha = 0.5;
+            s2_0_alpha = (0.05 / M ^ (1 / nu_alpha)) ^ 2;
+            nu_beta = 0.5;
+            s2_0_beta = (0.05 / J ^ (1 / nu_beta)) ^ 2;
+            
+            ones = rep_vector(1., N);
+            x1 = append_col(ones, x);
+
+    return @stan begin end
+    @stan begin 
+        target = 0.
+        @parameters begin
+            sigma2_alpha::real(lower=0);
+            sigma2_beta::real(lower=0);
+            alpha::matrix[M, J];
+            beta::matrix[J, K - 1];
+            alpha1::row_vector[J];
+            beta1::row_vector[K - 1];
+        end
+        @model @views begin
+            v = append_col(
+                ones,
+                append_col(
                     ones,
-                    append_col(
-                        ones,
-                        tanh(x1 * append_row(alpha1, alpha))
-                    ) * append_row(beta1, beta)
-                );
-                alpha1 ~ normal(0, 1);
-                beta1 ~ normal(0, 1);
-                sigma2_alpha ~ inv_gamma(nu_alpha / 2, nu_alpha * s2_0_alpha / 2);
-                sigma2_beta ~ inv_gamma(nu_beta / 2, nu_beta * s2_0_beta / 2);
-                
-                to_vector(alpha) ~ normal(0, sqrt(sigma2_alpha));
-                to_vector(beta) ~ normal(0, sqrt(sigma2_beta));
-                for n in 1:N
-                    y[n] ~ categorical_logit(v[n]');
-                end
+                    tanh.(x1 * append_row(alpha1, alpha))
+                ) * append_row(beta1, beta)
+            );
+            alpha1 ~ normal(0, 1);
+            beta1 ~ normal(0, 1);
+            sigma2_alpha ~ inv_gamma(nu_alpha / 2, nu_alpha * s2_0_alpha / 2);
+            sigma2_beta ~ inv_gamma(nu_beta / 2, nu_beta * s2_0_beta / 2);
+            
+            (alpha) ~ normal(0, sqrt(sigma2_alpha));
+            (beta) ~ normal(0, sqrt(sigma2_beta));
+            for n in 1:N
+                y[n] ~ categorical_logit(v[n, :]);
             end
-            return target
+        end
+        return target
     end
 end
 julia_implementation(::Val{:nn_rbm1bJ100}; N, M, x, K, y, kwargs...) = begin 
-        J = 100
-        nu_alpha = 0.5;
-        s2_0_alpha = (0.05 / M ^ (1 / nu_alpha)) ^ 2;
-        nu_beta = 0.5;
-        s2_0_beta = (0.05 / J ^ (1 / nu_beta)) ^ 2;
-        
-        ones = rep_vector(1., N);
-        x1 = append_col(ones, x);
-@stan begin 
-            target = 0.
-            @parameters begin
-                sigma2_alpha::real(lower=0);
-                sigma2_beta::real(lower=0);
-                alpha::matrix[M, J];
-                beta::matrix[J, K - 1];
-                alpha1::row_vector[J];
-                beta1::row_vector[K - 1];
-            end
-            @model begin
-                v = append_col(
+    J = 100
+    nu_alpha = 0.5;
+    s2_0_alpha = (0.05 / M ^ (1 / nu_alpha)) ^ 2;
+    nu_beta = 0.5;
+    s2_0_beta = (0.05 / J ^ (1 / nu_beta)) ^ 2;
+    
+    ones = rep_vector(1., N);
+    x1 = append_col(ones, x);
+    return @stan begin end
+    @stan begin 
+        target = 0.
+        @parameters begin
+            sigma2_alpha::real(lower=0);
+            sigma2_beta::real(lower=0);
+            alpha::matrix[M, J];
+            beta::matrix[J, K - 1];
+            alpha1::row_vector[J];
+            beta1::row_vector[K - 1];
+        end
+        @model @views begin
+            v = append_col(
+                ones,
+                append_col(
                     ones,
-                    append_col(
-                        ones,
-                        tanh(x1 * append_row(alpha1, alpha))
-                    ) * append_row(beta1, beta)
-                );
-                alpha1 ~ normal(0, 1);
-                beta1 ~ normal(0, 1);
-                sigma2_alpha ~ inv_gamma(nu_alpha / 2, nu_alpha * s2_0_alpha / 2);
-                sigma2_beta ~ inv_gamma(nu_beta / 2, nu_beta * s2_0_beta / 2);
-                
-                to_vector(alpha) ~ normal(0, sqrt(sigma2_alpha));
-                to_vector(beta) ~ normal(0, sqrt(sigma2_beta));
-                for n in 1:N
-                    y[n] ~ categorical_logit(v[n]');
-                end
+                    tanh.(x1 * append_row(alpha1, alpha))
+                ) * append_row(beta1, beta)
+            );
+            alpha1 ~ normal(0, 1);
+            beta1 ~ normal(0, 1);
+            sigma2_alpha ~ inv_gamma(nu_alpha / 2, nu_alpha * s2_0_alpha / 2);
+            sigma2_beta ~ inv_gamma(nu_beta / 2, nu_beta * s2_0_beta / 2);
+            
+            (alpha) ~ normal(0, sqrt(sigma2_alpha));
+            (beta) ~ normal(0, sqrt(sigma2_beta));
+            for n in 1:N
+                y[n] ~ categorical_logit(v[n, :]);
             end
-            return target
+        end
+        return target
     end
 end
+julia_implementation(::Val{:Survey_model}; nmax, m, k) = begin 
+    nmin = maximum(k)
+    @stan begin 
+        @parameters begin 
+            theta::real(lower=0, upper=1)
+        end
+        @model begin 
+            target += log_sum_exp([
+                n < nmin ? log(1.0 / nmax) - Inf : log(1.0 / nmax) + binomial_lpmf(k, n, theta)
+                for n in 1:nmax
+            ])
+        end
+    end
+end
+
+julia_implementation(::Val{:sir}; N_t, t, y0, stoi_hat, B_hat) = begin 
+    y0 = collect(Float64, y0)
+    simple_SIR(t, y, theta, x_r, x_i)  = begin
+        dydt = zero(y)
+        
+        dydt[1] = -theta[1] * y[4] / (y[4] + theta[2]) * y[1];
+        dydt[2] = theta[1] * y[4] / (y[4] + theta[2]) * y[1] - theta[3] * y[2];
+        dydt[3] = theta[3] * y[2];
+        dydt[4] = theta[4] * y[2] - theta[5] * y[4];
+        
+        return dydt;
+    end
+    t0 = 0.
+    kappa = 1000000.
+    @stan begin 
+        @parameters begin 
+            beta::real(lower=0)
+            gamma::real(lower=0)
+            xi::real(lower=0)
+            delta::real(lower=0)
+        end
+        @model @views begin 
+            y = integrate_ode_rk45(simple_SIR, y0, t0, t, [beta, kappa, gamma, xi, delta]);
+
+            beta ~ cauchy(0, 2.5);
+            gamma ~ cauchy(0, 1);
+            xi ~ cauchy(0, 25);
+            delta ~ cauchy(0, 1);
+
+            stoi_hat[1] ~ poisson(y0[1] - y[1, 1]);
+            for n in 2:N_t
+                stoi_hat[n] ~ poisson(max(1e-16, y[n - 1, 1] - y[n, 1]));
+            end
+            
+            B_hat ~ lognormal(@broadcasted(nothrow_log(y[:, 4])), 0.15);
+        
+        end
+    end
+end
+
+julia_implementation(::Val{:lotka_volterra}; N, ts, y_init, y) = begin 
+    dz_dt(t, z, theta, x_r, x_i)  = begin
+        u, v = z
+        
+        alpha, beta, gamma, delta = theta
+
+        du_dt = (alpha - beta * v) * u
+        dv_dt = (-gamma +delta * u) * v
+        [du_dt, dv_dt]
+    end
+    @stan begin 
+        @parameters begin 
+            theta::real(lower=0)[4]
+            z_init::real(lower=0)[2]
+            sigma::real(lower=0)[2]
+        end
+        @model @views begin 
+            z = integrate_ode_rk45(dz_dt, z_init, 0, ts, theta,
+                missing, missing, 1e-5, 1e-3, 5e2);
+
+            theta[[1,3]] ~ normal(1, 0.5);
+            theta[[2,4]] ~ normal(0.05, 0.05);
+            sigma ~ lognormal(-1, 1);
+            z_init ~ lognormal(log(10), 1);
+            y_init ~ lognormal(@broadcasted(log(z_init)), sigma);
+            y ~ lognormal(@broadcasted(nothrow_log(z)), sigma');
+        end
+    end
+end
+
+julia_implementation(::Val{:soil_incubation}; totalC_t0, t0, N_t, ts, eCO2mean, kwargs...) = begin 
+    two_pool_feedback(t, C, theta, x_r, x_i)  = begin
+        k1, k2, alpha21, alpha12 = theta
+        [
+            -k1 * C[1] + alpha12 * k2 * C[2]
+            -k2 * C[2] + alpha21 * k1 * C[1]
+        ]
+    end
+    evolved_CO2(N_t, t0, ts, gamma, totalC_t0, k1, k2, alpha21, alpha12) = begin 
+        C_t0 = [gamma * totalC_t0, (1 - gamma) * totalC_t0]
+        theta = k1, k2, alpha21, alpha12
+        C_hat = integrate_ode_rk45(two_pool_feedback, C_t0, t0, ts, theta)
+        totalC_t0 .- sum.(eachrow(C_hat))
+    end
+    @stan begin 
+        @parameters begin 
+            k1::real(lower=0)
+            k2::real(lower=0)
+            alpha21::real(lower=0)
+            alpha12::real(lower=0)
+            gamma::real(lower=0, upper=1)
+            sigma::real(lower=0)
+        end
+        @model @views begin 
+            eCO2_hat = evolved_CO2(N_t, t0, ts, gamma, totalC_t0, k1, k2, alpha21, alpha12)
+            gamma ~ beta(10, 1); 
+            k1 ~ normal(0, 1);
+            k2 ~ normal(0, 1);
+            alpha21 ~ normal(0, 1);
+            alpha12 ~ normal(0, 1);
+            sigma ~ cauchy(0, 1);
+            eCO2mean ~ normal(eCO2_hat, sigma);
+        end
+    end
+end
+
+julia_implementation(::Val{:one_comp_mm_elim_abs}; t0, D, V, N_t, times, C_hat) = begin 
+    one_comp_mm_elim_abs(t, y, theta, x_r, x_i)  = begin
+        k_a, K_m, V_m = theta
+        D, V = x_r
+        dose = 0.
+        elim = (V_m / V) * y[1] / (K_m + y[1]);
+        if t > 0
+            dose = exp(-k_a * t) * D * k_a / V;
+        end
+        [dose - elim]
+    end
+    C0 = [0.]
+    x_r = [D,V]
+    x_i = missing
+    @stan begin 
+        @parameters begin 
+            k_a::real(lower=0)
+            K_m::real(lower=0)
+            V_m::real(lower=0)
+            sigma::real(lower=0)
+        end
+        @model @views begin 
+            theta = [k_a, K_m, V_m]
+            C = integrate_ode_bdf(one_comp_mm_elim_abs, C0, t0, times, theta, x_r, x_i)
+            k_a ~ cauchy(0, 1);
+            K_m ~ cauchy(0, 1);
+            V_m ~ cauchy(0, 1);
+            sigma ~ cauchy(0, 1);
+            
+            C_hat ~ lognormal(@broadcasted(nothrow_log(C[:, 1])), sigma);
+        end
+    end
+end
+
+
 julia_implementation(::Val{:bym2_offset_only}; N, N_edges, node1, node2, y, E, scaling_factor, kwargs...) = begin 
         log_E = @. log(E)
 @stan begin 
@@ -1918,9 +2116,9 @@ julia_implementation(::Val{:bym2_offset_only}; N, N_edges, node1, node2, y, E, s
                 theta::vector[N];
                 phi::vector[N];
             end
-            convolved_re = @. sqrt(1 - rho) * theta + sqrt(rho / scaling_factor) * phi
-            @model begin
-                y ~ poisson_log(@broadcasted (log_E + beta0 + convolved_re * sigma));
+            convolved_re = @broadcasted(sqrt(1 - rho) * theta + sqrt(rho / scaling_factor) * phi)
+            @model @views begin
+                y ~ poisson_log(@broadcasted(log_E + beta0 + convolved_re * sigma));
                 
                 target += -0.5 * dot_self(phi[node1] - phi[node2]);
                 
@@ -1940,13 +2138,13 @@ julia_implementation(::Val{:bones_model}; nChild, nInd, gamma, delta, ncat, grad
             @parameters begin
                 theta::real[nChild]
             end
-            @model begin
+            @model @views begin
                 theta ~ normal(0.0, 36.);
                 for i in 1:nChild
                     for j in 1:nInd
                         Q = vcat(
                             1., 
-                            @broadcasted(inv_logit(delta[j] * (theta[i] - gamma[j, 1:(ncat[j]-1)]))),
+                            @.(inv_logit(delta[j] * (theta[i] - gamma[j, 1:(ncat[j]-1)]))),
                             0.
                         )
                         p = Q[1:end-1] - Q[2:end]
@@ -1965,7 +2163,7 @@ julia_implementation(::Val{:logistic_regression_rhs}; n, d, y, x, scale_icept,
     nu_local, 
     slab_scale,
     slab_df, kwargs...) = begin 
-        x_ = x
+        x = Matrix{Float64}(x)
 @stan begin 
             target = 0.
             @parameters begin
@@ -1977,7 +2175,7 @@ julia_implementation(::Val{:logistic_regression_rhs}; n, d, y, x, scale_icept,
             end
             c = slab_scale * sqrt(caux);
             lambda_tilde = @broadcasted sqrt(c ^ 2 * square(lambda) / (c ^ 2 + tau ^ 2 * square(lambda)));
-            beta = @broadcasted z * lambda_tilde * tau;
+            beta = @. z * lambda_tilde * tau;
             @model begin
                 z ~ std_normal();
                 lambda ~ student_t(nu_local, 0., 1.);
@@ -1985,7 +2183,7 @@ julia_implementation(::Val{:logistic_regression_rhs}; n, d, y, x, scale_icept,
                 caux ~ inv_gamma(0.5 * slab_df, 0.5 * slab_df);
                 beta0 ~ normal(0., scale_icept);
                 
-                y ~ bernoulli_logit_glm(x_, beta0, beta);
+                y ~ bernoulli_logit_glm(x, beta0, beta);
             end
             return target
         end
@@ -2005,7 +2203,7 @@ julia_implementation(::Val{:hmm_example}; N, K, y, kwargs...) = begin
             target += normal_lpdf(mu[2], 10, 1);
             gamma = @. normal_lpdf(y[1], mu, 1) 
             for t in 2:N
-                gamma = [
+                gamma .= [
                     log_sum_exp(@broadcasted(
                         gamma + log(theta[:, k]) 
                         + normal_lpdf(y[t], mu[k], 1) 
@@ -2034,11 +2232,11 @@ julia_implementation(::Val{:Mb_model}; M, T, y, kwargs...) = begin
                 p::real(lower=0.,upper=1.)
                 c::real(lower=0.,upper=1.)
             end
-            p_eff = hcat(
-                fill(p, M), 
-                @broadcasted (1 - y[:, 1:end-1]) * p + y[:, 1:end-1] * c
-            )
-            @model begin
+            @model @views begin
+                p_eff = hcat(
+                    fill(p, M), 
+                    @. (1 - y[:, 1:end-1]) * p + y[:, 1:end-1] * c
+                )
                 for i in 1:M
                     if s[i] > 0
                         target += bernoulli_lpmf(1, omega) + bernoulli_lpmf(y[i, :], p_eff[i, :])
@@ -2094,7 +2292,7 @@ julia_implementation(::Val{:Mth_model}; M, T, y, kwargs...) = begin
                 C += 1
             end
         end
-@stan begin 
+        @stan begin 
             target = 0.
             @parameters begin
                 omega::real(lower=0.,upper=1.)
@@ -2102,8 +2300,8 @@ julia_implementation(::Val{:Mth_model}; M, T, y, kwargs...) = begin
                 sigma::real(lower=0., upper=5.)
                 eps_raw::vector[M]
             end
-            logit_p = @. logit(mean_p)' .+ sigma * eps_raw
-            @model begin
+            @model @views begin
+                logit_p = @. logit(mean_p)' .+ sigma * eps_raw
                 eps_raw ~ normal(0., 1.)
                 for i in 1:M
                     if s[i] > 0
@@ -2120,7 +2318,7 @@ julia_implementation(::Val{:Mth_model}; M, T, y, kwargs...) = begin
 end
 julia_implementation(::Val{Symbol("2pl_latent_reg_irt")}; I, J, N, ii, jj, y, K, W, kwargs...) = begin 
     obtain_adjustments(W) = begin 
-        M, K = size(W)
+        local M, K = size(W)
         adj = zeros((2, K))
         adj[1,1] = 0
         adj[2, 1] = 1
@@ -2138,26 +2336,26 @@ julia_implementation(::Val{Symbol("2pl_latent_reg_irt")}; I, J, N, ii, jj, y, K,
         end
         return adj
     end
-        adj = obtain_adjustments(W);
-        W_adj = @. ((W - adj[1:1,:])/adj[2:2,:])
-@stan begin 
-            target = 0.
-            @parameters begin
-                alpha::vector(lower=0)[I];
-                beta_free::vector[I - 1] ;
-                theta::vector[J];
-                lambda_adj::vector[K];
-            end
-            beta = vcat(beta_free, -sum(beta_free))
-            @model begin
-                alpha ~ lognormal(1, 1);
-                target += normal_lpdf(beta, 0, 3);
-                lambda_adj ~ student_t(3, 0, 1);
-                theta ~ normal(W_adj * lambda_adj, 1);
-                y ~ bernoulli_logit(@broadcasted(alpha[ii] * theta[jj] - beta[ii]));
-            end
-            return target
+    adj = obtain_adjustments(W);
+    W_adj = @. ((W - adj[1:1,:])/adj[2:2,:])
+    @stan begin 
+        target = 0.
+        @parameters begin
+            alpha::vector(lower=0)[I];
+            beta_free::vector[I - 1] ;
+            theta::vector[J];
+            lambda_adj::vector[K];
         end
+        beta = vcat(beta_free, -sum(beta_free))
+        @model @views begin
+            alpha ~ lognormal(1, 1);
+            target += normal_lpdf(beta, 0, 3);
+            lambda_adj ~ student_t(3, 0, 1);
+            theta ~ normal(W_adj * lambda_adj, 1);
+            y ~ bernoulli_logit(@broadcasted(alpha[ii] * theta[jj] - beta[ii]));
+        end
+        return target
+    end
 end
 julia_implementation(::Val{:Mtbh_model}; M, T, y, kwargs...) = begin 
         @assert size(y) == (M, T) 
@@ -2178,13 +2376,13 @@ julia_implementation(::Val{:Mtbh_model}; M, T, y, kwargs...) = begin
                 sigma::real(lower=0, upper=3)
                 eps_raw::vector[M]
             end
-            eps = @. sigma * eps_raw
-            alpha = @. logit(mean_p)
-            logit_p = hcat(
-                @.(alpha[1] + eps),
-                @.(alpha[2:end]' + eps + gamma * y[:, 1:end-1])
-            )
-            @model begin
+            @model @views begin
+                eps = @. sigma * eps_raw
+                alpha = @. logit(mean_p)
+                logit_p = hcat(
+                    @.(alpha[1] + eps),
+                    @.(alpha[2:end]' + eps + gamma * y[:, 1:end-1])
+                )
                 gamma ~ normal(0, 10)
                 eps_raw ~ normal(0, 1)
                 for i in 1:M
@@ -2223,7 +2421,7 @@ julia_implementation(::Val{:multi_occupancy}; J, K, n, X, S, kwargs...) = begin
             @parameters begin
                 alpha::real
                 beta::real
-                Omega::real(lower=-1, upper=+1)
+                Omega::real(lower=0, upper=+1)
                 rho_uv::real(lower=-1, upper=+1)
                 sigma_uv::vector(lower=0,upper=+Inf)[2]
                 uv1::vector[S]
@@ -2231,16 +2429,15 @@ julia_implementation(::Val{:multi_occupancy}; J, K, n, X, S, kwargs...) = begin
             end
             @transformed_parameters begin 
                 uv = hcat(uv1, uv2)
-                logit_psi = @. uv[:, 1] + alpha
-                logit_theta = @. uv[:, 2] + beta
+                logit_psi = @. uv1 + alpha
+                logit_theta = @. uv2 + beta
             end
             @model begin
                 alpha ~ cauchy(0, 2.5);
                 beta ~ cauchy(0, 2.5);
                 sigma_uv ~ cauchy(0, 2.5);
                 (rho_uv + 1) / 2 ~ beta(2, 2);
-                target += multi_normal_lpdf(uv, rep_vector(0, 2), cov_matrix_2d(sigma_uv,
-                                                                                 rho_uv));
+                target += multi_normal_lpdf(uv, rep_vector(0., 2), cov_matrix_2d(sigma_uv, rho_uv));
                 Omega ~ beta(2, 2);
   
                 for i in 1:n 
@@ -2280,7 +2477,7 @@ kwargs...) = begin
         pow_t_omega = t ^ omega;
         return pow_t_omega / (pow_t_omega + theta ^ omega);
     end
-@stan begin 
+    @stan begin 
             target = 0.
             @parameters begin
                 omega::real(lower=0);
@@ -2298,8 +2495,7 @@ kwargs...) = begin
             else
                 @. growth_factor_loglogistic(t_value, omega, theta)
             end
-            lm = @. LR[cohort_id] * premium[cohort_id] * gf[t_idx];
-            @model begin
+            @model @views begin
                 mu_LR ~ normal(0, 0.5);
                 sd_LR ~ lognormal(0, 0.5);
                 
@@ -2310,7 +2506,7 @@ kwargs...) = begin
                 omega ~ lognormal(0, 0.5);
                 theta ~ lognormal(0, 0.5);
                 
-                loss ~ normal(lm, (loss_sd * premium)[cohort_id]);
+                loss ~ normal(@broadcasted(LR[cohort_id] * premium[cohort_id] * gf[t_idx]), (loss_sd * premium)[cohort_id]);
             end
             return target
     end
@@ -2357,7 +2553,7 @@ julia_implementation(::Val{Symbol("grsm_latent_reg_irt")}; I, J, N, ii, jj, y, K
       return categorical_lpmf(y + 1, probs);
     end
     obtain_adjustments(W) = begin 
-        M, K = size(W)
+        local M, K = size(W)
         adj = zeros((2, K))
         adj[1,1] = 0
         adj[2, 1] = 1
@@ -2389,7 +2585,7 @@ julia_implementation(::Val{Symbol("grsm_latent_reg_irt")}; I, J, N, ii, jj, y, K
             end
             beta = vcat(beta_free, -sum(beta_free))
             kappa = vcat(kappa_free, -sum(kappa_free))
-            @model begin
+            @model @views begin
                 alpha ~ lognormal(1, 1);
                 target += normal_lpdf(beta, 0, 3);
                 target += normal_lpdf(kappa, 0, 3);
@@ -2403,22 +2599,22 @@ julia_implementation(::Val{Symbol("grsm_latent_reg_irt")}; I, J, N, ii, jj, y, K
     end
 end
 julia_implementation(::Val{:prophet};
-T,
-K,
-t,
-cap,
-y,
-S,
-t_change,
-X,
-sigmas,
-tau,
-trend_indicator,
-s_a,
-s_m, 
-kwargs...) = begin 
+    T,
+    K,
+    t,
+    cap,
+    y,
+    S,
+    t_change,
+    X,
+    sigmas,
+    tau,
+    trend_indicator,
+    s_a,
+    s_m, 
+    kwargs...) = begin 
     get_changepoint_matrix(t, t_change, T, S) = begin
-        A = rep_matrix(0, T, S);
+        local A = rep_matrix(0, T, S);
         a_row = rep_row_vector(0, S);
         cp_idx = 1;
         
@@ -2446,11 +2642,11 @@ kwargs...) = begin
       
       logistic_trend(k, m, delta, t, cap, A, t_change, S) = begin
         gamma = logistic_gamma(k, m, delta, t_change, S);
-        return cap .* inv_logit((k .+ A * delta) .* (t - (m .+ A * gamma)));
+        return cap .* inv_logit.((k .+ A * delta) .* (t .- m .- A * gamma));
       end
       
       linear_trend(k, m, delta, t, A, t_change) = begin
-        return (k .+ A * delta) .* t + (m .+ A * (-t_change .* delta));
+        return (k .+ A * delta) .* t .+ (m .+ A * (-t_change .* delta));
       end
         A = get_changepoint_matrix(t, t_change, T, S)
 @stan begin 
@@ -2488,12 +2684,12 @@ julia_implementation(::Val{:hmm_gaussian}; T, K, y, kwargs...) = begin
             pi1::simplex[K]
             A::simplex[K,K]
             mu::ordered[K]
-            sigma::vector[K](lower=0)
+            sigma::vector(lower=0)[K]
         end
-        @model begin
-            logalpha = log(pi1) + normal_lpdf(y[1], mu, sigma);
+        @model @views begin
+            logalpha = log.(pi1) .+ normal_lpdf(y[1], mu, sigma);
             for t in 2 : T
-                logalpha = ([
+                logalpha .= ([
                     log_sum_exp(@broadcasted(
                         logalpha + log(A[:, j]) + normal_lpdf(y[t], mu[j], sigma[j])
                     ))
@@ -2505,6 +2701,156 @@ julia_implementation(::Val{:hmm_gaussian}; T, K, y, kwargs...) = begin
         return target
     end
 end
+
+julia_implementation(::Val{:hmm_drive_0}; K, N, u, v, alpha, kwargs...) = begin 
+    @stan begin 
+        target = 0.
+        @parameters begin
+            theta1::simplex[K]
+            theta2::simplex[K]
+            phi::positive_ordered[K]
+            lambda::positive_ordered[K]
+        end
+        theta = hcat(theta1, theta2)'
+        @model @views begin
+            for k in 1:K
+              target += dirichlet_lpdf(theta[k, :], alpha[k, :]);
+            end
+            target += normal_lpdf(phi[1], 0, 1);
+            target += normal_lpdf(phi[2], 3, 1);
+            target += normal_lpdf(lambda[1], 0, 1);
+            target += normal_lpdf(lambda[2], 3, 1);
+            gamma = @.(exponential_lpdf(u[1], phi) + exponential_lpdf(v[1], lambda))
+            for t in 2:N
+                gamma .= ([
+                    log_sum_exp(@broadcasted(
+                        gamma + log(theta[:, k]) + exponential_lpdf(u[t], phi[k]) + exponential_lpdf(v[t], lambda[k])
+                    ))
+                    for k in 1:K
+                ]);
+            end
+            target += log_sum_exp(gamma);
+        end
+        return target
+    end
+end
+
+julia_implementation(::Val{:hmm_drive_1}; K, N, u, v, alpha, tau, rho, kwargs...) = begin 
+    @stan begin 
+        @parameters begin
+            theta1::simplex[K]
+            theta2::simplex[K]
+            phi::ordered[K]
+            lambda::ordered[K]
+        end
+        theta = hcat(theta1, theta2)'
+        @model @views begin
+            for k in 1:K
+              target += dirichlet_lpdf(theta[k, :], alpha[k, :]);
+            end
+            target += normal_lpdf(phi[1], 0, 1);
+            target += normal_lpdf(phi[2], 3, 1);
+            target += normal_lpdf(lambda[1], 0, 1);
+            target += normal_lpdf(lambda[2], 3, 1);
+            gamma = @.(normal_lpdf(u[1], phi, tau) + normal_lpdf(v[1], lambda, rho))
+            for t in 2:N
+                gamma .= ([
+                    log_sum_exp(@broadcasted(
+                        gamma + log(theta[:, k]) + normal_lpdf(u[t], phi[k], tau) + normal_lpdf(v[t], lambda[k], rho)
+                    ))
+                    for k in 1:K
+                ]);
+            end
+            target += log_sum_exp(gamma);
+        end
+        return target
+    end
+end
+
+julia_implementation(::Val{:iohmm_reg}; T, K, M, y, u, kwargs...) = begin 
+    @inline normalize(x) = x ./ sum(x)
+    @stan begin 
+        @parameters begin
+            pi1::simplex[K]
+            w::vector[K,M]
+            b::vector[K,M]
+            sigma::vector(lower=0)[K]
+        end
+        @model @views begin
+            unA = hcat(pi1, w * u'[:, 2:end])'
+            A = copy(unA)
+            for t in 2:T
+                A[t, :] .= softmax(unA[t, :])
+            end
+            logoblik = normal_lpdf.(y, u * b', sigma')
+            logalpha = @.(log(pi1) + logoblik[1,:])
+            for t in 2:T
+                logalpha .= ([
+                    log_sum_exp(@broadcasted(
+                        logalpha + log(A[t,:]) + logoblik[t, j]
+                    ))
+                    for j in 1:K
+                ]);
+            end
+            w ~ normal(0, 5);
+            b ~ normal(0, 5);
+            sigma ~ normal(0, 3);
+            target += log_sum_exp(logalpha);
+        end
+        return target
+    end
+end
+
+julia_implementation(::Val{:accel_gp}; N, Y, Kgp_1, Dgp_1, NBgp_1, Xgp_1, slambda_1, Kgp_sigma_1, Dgp_sigma_1, NBgp_sigma_1, Xgp_sigma_1, slambda_sigma_1, prior_only, kwargs...) = begin 
+    @inline sqrt_spd_cov_exp_quad(slambda, sdgp, lscale) = begin 
+        NB, D = size(slambda)
+        Dls = length(lscale)
+        if Dls == 1
+            constant = (sdgp) * (sqrt(2 * pi) * lscale[1]) ^ (D/2)
+            neg_half_lscale2 = -0.25 * square(lscale[1])
+            @.(constant * exp(neg_half_lscale2 * dot_self($eachrow(slambda))))
+        else
+            error()
+        end
+    end
+    @inline gpa(X, sdgp, lscale, zgp, slambda) = X * (sqrt_spd_cov_exp_quad(slambda, sdgp, lscale) .* zgp)
+    @stan begin 
+        @parameters begin
+            Intercept::real
+            sdgp_1::real(lower=0)
+            lscale_1::real(lower=0)
+            zgp_1::vector[NBgp_1]
+            Intercept_sigma::real
+            sdgp_sigma_1::real(lower=0)
+            lscale_sigma_1::real(lower=0)
+            zgp_sigma_1::vector[NBgp_sigma_1]
+        end
+        vsdgp_1 = fill(sdgp_1, 1)
+        vlscale_1 = fill(lscale_1, (1, 1))
+        vsdgp_sigma_1 = fill(sdgp_sigma_1, 1)
+        vlscale_sigma_1 = fill(lscale_sigma_1, (1, 1))
+        @model @views begin
+            mu = Intercept .+ gpa(Xgp_1, vsdgp_1[1], vlscale_1[1,:], zgp_1, slambda_1);
+            sigma = exp.(Intercept_sigma .+ gpa(Xgp_sigma_1, vsdgp_sigma_1[1], vlscale_sigma_1[1,:], zgp_sigma_1, slambda_sigma_1));
+            target += student_t_lpdf(Intercept, 3, -13, 36);
+            target += student_t_lpdf(vsdgp_1, 3, 0, 36)
+                    #   - 1 * student_t_lccdf(0, 3, 0, 36);
+            target += normal_lpdf(zgp_1, 0, 1);
+            target += inv_gamma_lpdf(vlscale_1[1,:], 1.124909, 0.0177);
+            target += student_t_lpdf(Intercept_sigma, 3, 0, 10);
+            target += student_t_lpdf(vsdgp_sigma_1, 3, 0, 36)
+                    #   - 1 * student_t_lccdf(0, 3, 0, 36);
+            target += normal_lpdf(zgp_sigma_1, 0, 1);
+            target += inv_gamma_lpdf(vlscale_sigma_1[1,:], 1.124909, 0.0177);
+            if prior_only == 0
+              target += normal_lpdf(Y, mu, sigma);
+            end
+        end
+        return target
+    end
+end
+
+
 
 julia_implementation(::Val{:hierarchical_gp};
         N,
@@ -2518,85 +2864,225 @@ julia_implementation(::Val{:hierarchical_gp};
         year_ind,
         y,
         kwargs...) = begin 
-@stan begin 
-            target = 0.
-            years = 1:N_years
-            counts = fill(2, 17)
-            @parameters begin
-                GP_region_std::matrix[N_years, N_regions]
-                GP_state_std::matrix[N_years, N_states]
-                year_std::vector[N_years_obs]
-                state_std::vector[N_states]
-                region_std::vector[N_regions]
-                tot_var::real(lower=0)
-                prop_var::simplex[17]
-                mu::real
-                length_GP_region_long::real(lower=0)
-                length_GP_state_long::real(lower=0)
-                length_GP_region_short::real(lower=0)
-                length_GP_state_short::real(lower=0)
-            end
-
-  
-            vars = 17 * prop_var * tot_var;
-            sigma_year = sqrt(vars[1]);
-            sigma_region = sqrt(vars[2]);
-            for i in 1:10
-                sigma_state[i] = sqrt(vars[i + 2]);
-            end
-            
-            sigma_GP_region_long = sqrt(vars[13]);
-            sigma_GP_state_long = sqrt(vars[14]);
-            sigma_GP_region_short = sqrt(vars[15]);
-            sigma_GP_state_short = sqrt(vars[16]);
-            sigma_error_state_2 = sqrt(vars[17]);
-            
-            region_re = sigma_region * region_std;
-            year_re = sigma_year * year_std;
-            state_re = sigma_state[state_region_ind] .* state_std;
-            
-            begin
-                cov_region = gp_exp_quad_cov(years, sigma_GP_region_long,
-                                            length_GP_region_long)
-                            + gp_exp_quad_cov(years, sigma_GP_region_short,
-                                            length_GP_region_short);
-                cov_state = gp_exp_quad_cov(years, sigma_GP_state_long,
-                                            length_GP_state_long)
-                            + gp_exp_quad_cov(years, sigma_GP_state_short,
-                                            length_GP_state_short);
-                for year in 1 : N_years
-                    cov_region[year, year] = cov_region[year, year] + 1e-6;
-                    cov_state[year, year] = cov_state[year, year] + 1e-6;
-                end
-                
-                L_cov_region = cholesky_decompose(cov_region);
-                L_cov_state = cholesky_decompose(cov_state);
-                GP_region = L_cov_region * GP_region_std;
-                GP_state = L_cov_state * GP_state_std;
-            end
-            @model begin
-                for n in 1 : N
-                    obs_mu[n] = mu + year_re[year_ind[n]] + state_re[state_ind[n]]
-                                + region_re[region_ind[n]]
-                                + GP_region[year_ind[n], region_ind[n]]
-                                + GP_state[year_ind[n], state_ind[n]];
-                  end
-                  y ~ normal(obs_mu, sigma_error_state_2); 
-                  
-                  to_vector(GP_region_std) ~ normal(0, 1);
-                  to_vector(GP_state_std) ~ normal(0, 1);
-                  year_std ~ normal(0, 1);
-                  state_std ~ normal(0, 1);
-                  region_std ~ normal(0, 1);
-                  mu ~ normal(.5, .5);
-                  tot_var ~ gamma(3, 3);
-                  prop_var ~ dirichlet(counts);
-                  length_GP_region_long ~ weibull(30, 8);
-                  length_GP_state_long ~ weibull(30, 8);
-                  length_GP_region_short ~ weibull(30, 3);
-                  length_GP_state_short ~ weibull(30, 3);
-            end
-            return target
+    @stan begin 
+        target = 0.
+        years = 1:N_years
+        counts = fill(2, 17)
+        @parameters begin
+            GP_region_std::matrix[N_years, N_regions]
+            GP_state_std::matrix[N_years, N_states]
+            year_std::vector[N_years_obs]
+            state_std::vector[N_states]
+            region_std::vector[N_regions]
+            tot_var::real(lower=0)
+            prop_var::simplex[17]
+            mu::real
+            length_GP_region_long::real(lower=0)
+            length_GP_state_long::real(lower=0)
+            length_GP_region_short::real(lower=0)
+            length_GP_state_short::real(lower=0)
         end
+
+
+        vars = 17 * prop_var * tot_var;
+        sigma_year = sqrt(vars[1]);
+        sigma_region = sqrt(vars[2]);
+        sigma_state = @.(sqrt(vars[3:end]))
+        
+        sigma_GP_region_long = sqrt(vars[13]);
+        sigma_GP_state_long = sqrt(vars[14]);
+        sigma_GP_region_short = sqrt(vars[15]);
+        sigma_GP_state_short = sqrt(vars[16]);
+        sigma_error_state_2 = sqrt(vars[17]);
+        
+        region_re = sigma_region * region_std;
+        year_re = sigma_year * year_std;
+        state_re = sigma_state[state_region_ind] .* state_std;
+        
+        begin
+            cov_region = gp_exp_quad_cov(years, sigma_GP_region_long,
+                                        length_GP_region_long)
+                        + gp_exp_quad_cov(years, sigma_GP_region_short,
+                                        length_GP_region_short);
+            cov_state = gp_exp_quad_cov(years, sigma_GP_state_long,
+                                        length_GP_state_long)
+                        + gp_exp_quad_cov(years, sigma_GP_state_short,
+                                        length_GP_state_short);
+            for year in 1 : N_years
+                cov_region[year, year] = cov_region[year, year] + 1e-6;
+                cov_state[year, year] = cov_state[year, year] + 1e-6;
+            end
+            
+            L_cov_region = cholesky_decompose(cov_region);
+            L_cov_state = cholesky_decompose(cov_state);
+            GP_region = L_cov_region * GP_region_std;
+            GP_state = L_cov_state * GP_state_std;
+        end
+        @model begin
+            obs_mu = zeros(N)
+            for n in 1 : N
+                obs_mu[n] = mu + year_re[year_ind[n]] + state_re[state_ind[n]]
+                            + region_re[region_ind[n]]
+                            + GP_region[year_ind[n], region_ind[n]]
+                            + GP_state[year_ind[n], state_ind[n]];
+                end
+                y ~ normal(obs_mu, sigma_error_state_2); 
+                
+                (GP_region_std) ~ normal(0, 1);
+                (GP_state_std) ~ normal(0, 1);
+                year_std ~ normal(0, 1);
+                state_std ~ normal(0, 1);
+                region_std ~ normal(0, 1);
+                mu ~ normal(.5, .5);
+                tot_var ~ gamma(3, 3);
+                prop_var ~ dirichlet(counts);
+                length_GP_region_long ~ weibull(30, 8);
+                length_GP_state_long ~ weibull(30, 8);
+                length_GP_region_short ~ weibull(30, 3);
+                length_GP_state_short ~ weibull(30, 3);
+        end
+        return target
+    end
+end
+julia_implementation(::Val{:kronecker_gp}; n1, n2, x1, y, kwargs...) = begin 
+    kron_mvprod(A, B, V) = adjoint(A * adjoint(B * V))
+    calculate_eigenvalues(A, B, sigma2) = A .* B' .+ sigma2
+    xd  = -(x1 .- x1') .^ 2
+    return @stan begin end
+    @stan begin 
+        @parameters begin
+            var1::real(lower=0)
+            bw1::real(lower=0)
+            L::cholesky_factor_corr[n2]
+            sigma1::real(lower=.00001)
+        end
+        Lambda = multiply_lower_tri_self_transpose(L)
+        Sigma1 = Symmetric(var1 .* exp.(xd .* bw1) + .00001 * I);
+        R1, Q1 = eigen(Sigma1);
+        R2, Q2 = eigen(Lambda);
+        eigenvalues = calculate_eigenvalues(R2, R1, sigma1);
+        @model @views begin
+            var1 ~ lognormal(0, 1);
+            bw1 ~ cauchy(0, 2.5);
+            sigma1 ~ lognormal(0, 1);
+            L ~ lkj_corr_cholesky(2);
+            target += -0.5 * sum(y .* kron_mvprod(Q1, Q2, kron_mvprod(transpose(Q1), transpose(Q2), y) ./ eigenvalues)) - 0.5 * sum(log(eigenvalues))
+        end
+        return target
+    end
+end
+
+
+julia_implementation(::Val{:covid19imperial_v2}; M, P, N0, N, N2, cases, deaths, f, X, EpidemicStart, pop, SI, kwargs...) = begin 
+    SI_rev = reverse(SI)
+    f_rev = mapreduce(reverse, hcat, eachcol(f))'
+    @stan begin 
+        @parameters begin
+            mu::real(lower=0)[M]
+            alpha_hier::real(lower=0)[P]
+            kappa::real(lower=0)
+            y::real(lower=0)[M]
+            phi::real(lower=0)
+            tau::real(lower=0)
+            ifr_noise::real(lower=0)[M]
+        end
+        @model @views begin
+            prediction = rep_matrix(0., N2, M);
+            E_deaths = rep_matrix(0., N2, M);
+            Rt = rep_matrix(0., N2, M);
+            Rt_adj = copy(Rt);
+            cumm_sum = rep_matrix(0., N2, M);
+            alpha = alpha_hier .- (log(1.05) / 6.)
+            for m in 1:M
+                prediction[1:N0, m] .= y[m]
+                cumm_sum[2:N0, m] .= cumulative_sum(prediction[2:N0, m]);
+                Rt[:, m] .= mu[m] * exp.(-X[m,:,:] * alpha);
+                Rt_adj[1:N0, m] .= Rt[1:N0, m];
+                for i in (N0+1):N2
+                    convolution = dot_product(sub_col(prediction, 1, m, i - 1), stan_tail(SI_rev, i - 1))
+                    cumm_sum[i, m] = cumm_sum[i - 1, m] + prediction[i - 1, m];
+                    Rt_adj[i, m] = ((pop[m] - cumm_sum[i, m]) / pop[m]) * Rt[i, m];
+                    prediction[i, m] = Rt_adj[i, m] * convolution;
+                end
+                E_deaths[1, m] = 1e-15 * prediction[1, m];
+                for i in 2:N2
+                    E_deaths[i, m] = ifr_noise[m] * dot_product(sub_col(prediction, 1, m, i - 1), stan_tail(f_rev[m, :], i - 1));
+                end
+            end
+            tau ~ exponential(0.03);
+            y ~ exponential(1 / tau)
+            phi ~ normal(0, 5);
+            kappa ~ normal(0, 0.5);
+            mu ~ normal(3.28, kappa);
+            alpha_hier ~ gamma(.1667, 1);
+            ifr_noise ~ normal(1, 0.1);
+            for m in 1:M
+                deaths[EpidemicStart[m] : N[m], m] ~ neg_binomial_2(E_deaths[EpidemicStart[m] : N[m], m],
+                                                            phi);
+            end
+        end
+        return target
+    end
+end
+
+
+julia_implementation(::Val{:covid19imperial_v3}; kwargs...) = julia_implementation(Val{:covid19imperial_v2}(); kwargs...)
+
+julia_implementation(::Val{:gpcm_latent_reg_irt}; I, J, N, ii, jj, y, K, W, kwargs...) = begin 
+    pcm(y, theta, beta) = begin 
+        unsummed = append_row(rep_vector(0.0, 1), theta .- beta)
+        probs = softmax(cumulative_sum(unsummed))
+        categorical_lpmf(y + 1, probs)
+    end
+    obtain_adjustments(W) = begin 
+        local M, K = size(W)
+        adj = zeros((2, K))
+        adj[1,1] = 0
+        adj[2, 1] = 1
+        for k in 2:K
+            min_w = minimum(W[:,k])
+            max_w = maximum(W[:,k])
+            minmax_count = sum(w->w in (min_w, max_w), W[:, k])
+            if minmax_count == M
+                adj[1, k] = mean(W[:, k]);
+                adj[2, k] = max_w - min_w;
+            else
+                adj[1, k] = mean(W[:, k]);
+                adj[2, k] = sd(W[:, k]) * 2;
+            end
+        end
+        return adj
+    end
+    m = fill(0, I)
+    pos = fill(1, I)
+    for n in 1:N
+        if y[n] > m[ii[n]]
+            m[ii[n]] = y[n]
+        end
+    end
+    for i in 2:I
+        pos[i] = m[i - 1] + pos[i - 1]
+    end
+    adj = obtain_adjustments(W);
+    W_adj = @. ((W - adj[1:1,:])/adj[2:2,:])
+    @stan begin 
+        @parameters begin
+            alpha::real(lower=0)[I]
+            beta_free::vector[sum(m) - 1]
+            theta::vector[J]
+            lambda_adj::vector[K]
+        end
+        beta = vcat(beta_free, -sum(beta_free))
+        @model @views begin
+            alpha ~ lognormal(1, 1);
+            target += normal_lpdf(beta, 0, 3);
+            theta ~ normal(W_adj * lambda_adj, 1);
+            lambda_adj ~ student_t(3, 0, 1);
+            for n in 1:N
+                target += pcm(y[n], theta[jj[n]] .* alpha[ii[n]], segment(beta, pos[ii[n]], m[ii[n]]));
+            end
+        end
+    end
 end
 end
+

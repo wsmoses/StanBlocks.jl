@@ -26,3 +26,4 @@ Manifest.toml
 *.pb.gz
 .vscode
 *.sjl
+stan_compilation

@@ -48,6 +48,8 @@ end
 
 
 const X_NAME = gensym("x")
+const TMP = gensym("tmp")
+const XPOS = gensym("xpos")
 
 macro_stan(x) = begin
     fname = gensym("stan_lpdf") 
@@ -78,63 +80,65 @@ macro generated_quantities(block)
     esc(macro_generated_quantities(block))
 end
 begin
-    macro_parameters(e; xpos) = e
-    macro_parameters(e::Symbol; xpos) = macro_parameters(:($e::real); xpos)
-    parameters_info(e::Symbol; xpos) = begin 
-        @assert e in (:real, :vector) e
-        :($X_NAME[$xpos]), xpos, -Inf, +Inf
+    macro_parameters(e) = e
+    # macro_parameters(e::Symbol; xpos) = macro_parameters(:($e::real); xpos)
+    # parameters_info(e::Symbol; xpos) = begin 
+    #     @assert e in (:real, :vector) e
+    #     :($X_NAME[$xpos]), xpos, -Inf, +Inf
+    # end
+    # parameters_info(e::Expr; xpos) = if e.head == :call
+    #     X_VIEW, xslice, lower, upper = parameters_info(e.args[1]; xpos)
+    #     for arg in e.args[2:end]
+    #         @assert Meta.isexpr(arg, :kw) arg
+    #         lower = arg.args[1] == :lower ? arg.args[2] : lower
+    #         upper = arg.args[1] == :upper ? arg.args[2] : upper
+    #     end
+    #     X_VIEW, xslice, lower, upper
+    # elseif e.head == :ref
+    #     @assert length(e.args) == 2 e.args
+    #     xslice = :($xpos:($xpos+$(e.args[2])-1))
+    #     _, _, lower, upper = parameters_info(e.args[1]; xpos)
+    #     :(view($X_NAME, $xslice)), xslice, lower, upper
+    # else
+    #     @error e.head
+    #     error()
+    # end
+    extract_kws(e::Symbol) = e, ()
+    extract_kws(e::Expr) = begin 
+        @assert e.head == :call
+        e.args[1]::Symbol
+        @assert all([Meta.isexpr(arg, :kw) for arg in e.args[2:end]])
+        e.args[1], e.args[2:end]
     end
-    parameters_info(e::Expr; xpos) = if e.head == :call
-        X_VIEW, xslice, lower, upper = parameters_info(e.args[1]; xpos)
-        for arg in e.args[2:end]
-            @assert Meta.isexpr(arg, :kw) arg
-            lower = arg.args[1] == :lower ? arg.args[2] : lower
-            upper = arg.args[1] == :upper ? arg.args[2] : upper
-        end
-        X_VIEW, xslice, lower, upper
-    elseif e.head == :ref
-        @assert length(e.args) == 2 e.args
-        xslice = :($xpos:($xpos+$(e.args[2])-1))
-        _, _, lower, upper = parameters_info(e.args[1]; xpos)
-        :(view($X_NAME, $xslice)), xslice, lower, upper
-    else
-        @error e.head
-        error()
-    end
-    macro_parameters(e::Expr; xpos=gensym("xpos")) = begin 
+    macro_parameters(e::Expr) = begin 
         if e.head == :block
-            Expr(e.head, :($xpos=1), macro_parameters.(e.args; xpos)...)
+            Expr(:block, :($XPOS=1), macro_parameters.(e.args)...)
         else
             @assert e.head == :(::)
-            name, type = e.args
-            stmts = if Meta.isexpr(type, :ref) && type.args[1] in (:simplex, :ordered, :positive_ordered, :cholesky_factor_corr, :matrix, :row_vector)
-                T, D = type.args
-                constrain = GlobalRef(StanBlocks, Symbol("$(T)_constrain"))
-                D = if T == :simplex
-                    :($D-1)
-                else
-                    D
-                end
-                xslice = :($xpos:($xpos+$D-1))
-                X_VIEW = :(view($X_NAME, $xslice))
+            name, varinfo = e.args
+            stmts = if !Meta.isexpr(varinfo, :ref)
+                type, kws = extract_kws(varinfo)
+                @assert type == :real
                 [
-                    :((target, $name) = $constrain(target, $X_VIEW)),
-                    :($xpos += $D)
+                    :(($TMP, $name) = StanBlocks.constrain($X_NAME[$XPOS]; $(kws...))),
+                    :(target += $TMP),
+                    :($XPOS += 1)
                 ]
             else
-                constrain = GlobalRef(StanBlocks, Symbol("constrain"))
-                X_VIEW, xslice, lower, upper = parameters_info(type; xpos)
+                type, kws = extract_kws(varinfo.args[1])
+                dims = varinfo.args[2:end]
+                constrain = Symbol(type, "_constrain")
+                isdefined(StanBlocks, constrain) && (constrain = :(StanBlocks.$constrain))
+                dim = Symbol(type, "_unconstrained_dim")
+                isdefined(StanBlocks, dim) && (dim = :(StanBlocks.$dim))
                 [
-                    :((target, $name) = $constrain(target, $X_VIEW, $lower, $upper)),
-                    :($xpos += length($xslice)) 
+                    :($XPOS = $XPOS:($XPOS+$dim($(dims...))-1)),
+                    :(($TMP, $name) = $constrain(view($X_NAME, $XPOS), $(dims...); $(kws...))),
+                    :(target += $TMP),
+                    :($XPOS = $XPOS[end]+1)
                 ]
             end
-            rv = Expr(
-                :block,
-                stmts...
-            )
-            # display(Pair(e, rv))
-            rv
+            Expr(:block, stmts...)
         end
     end
     macro_model(e) = e
@@ -143,7 +147,8 @@ begin
             lhs = e.args[2]
             rhs = e.args[3]
             @assert Meta.isexpr(rhs, :call)
-            lpdf = GlobalRef(StanBlocks, Symbol("$(rhs.args[1])_lpdf"))
+            lpdf = Symbol("$(rhs.args[1])_lpdf")
+            isdefined(StanBlocks, lpdf) && (lpdf = :(StanBlocks.$lpdf))
             rhsargs = rhs.args[2:end]
             rv = :(target += $lpdf($lhs, $(rhsargs...)))
             # display(Pair(e, rv))
