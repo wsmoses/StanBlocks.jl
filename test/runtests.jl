@@ -1,5 +1,7 @@
 import Test, StanBlocks, PosteriorDB, StanLogDensityProblems, LogDensityProblems
 
+using Enzyme, BenchmarkTools, Mooncake, DifferentiationInterface
+
 pdb = PosteriorDB.database()
 for posterior_name in PosteriorDB.posterior_names(pdb)
     post = PosteriorDB.posterior(pdb, posterior_name)
@@ -31,4 +33,23 @@ for posterior_name in PosteriorDB.posterior_names(pdb)
     else
         @warn "Logdensity may be wrong: $(hcat(jlpdfs, slpdfs))"
     end
+    inp = collect(first(eachcol(X)))
+    @show "primal", posterior_name
+    @btime $jlpdf($inp)
+
+    try
+        @show "enzyme grad", posterior_name
+        @btime Enzyme.gradient(Reverse, $(Const(jlpdf)), $inp)
+    catch e
+        @show e
+    end
+
+    @show "enzyme grad RTA", posterior_name
+    @btime Enzyme.gradient(Enzyme.set_runtime_activity(Reverse), $(Const(jlpdf)), $inp)
+
+    @show "mooncake grad", posterior_name
+
+    backend = AutoMooncake(; config=nothing)
+    prep = DifferentiationInterface.prepare_gradient(jlpdf, backend, inp)
+    @btime DifferentiationInterface.gradient($jlpdf, $prep, $backend, $inp)
 end
